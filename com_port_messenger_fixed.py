@@ -35,6 +35,15 @@ MAX_DATA_SIZE = (
 
 BODY_SIZE = MAX_DATA_SIZE + 3 * SERVICE_FIELD_SIZE + RESERVED_SIZE
 BODY_BITS = BODY_SIZE * 8
+PAYLOAD_SIZE = BODY_SIZE - RESERVED_SIZE
+STUFF_MAP_BITS = RESERVED_SIZE * 8
+STUFF_COUNT_BITS = 4
+STUFF_OFFSET_BITS = 3
+STUFF_POSITION_BITS = 7
+MAX_STUFF_POSITIONS = 10
+
+if STUFF_COUNT_BITS + STUFF_OFFSET_BITS + MAX_STUFF_POSITIONS * STUFF_POSITION_BITS > STUFF_MAP_BITS:
+    raise ValueError("Недостаточно места для карты бит-стаффинга.")
 
 
 # ============================================================
@@ -65,7 +74,6 @@ class Frame:
         self.flag = FRAME_FLAG
         self.data = data
 
-        # Пока не используются — передаются нулевыми
         self.frame_type = 0
         self.frame_number = 0
         self.checksum = 0
@@ -93,12 +101,6 @@ class Frame:
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
-# Порог классического стаффинга: после стольких единиц — один '0'.
-# Однопроходная схема даёт минимум вставок (ровно одна на каждые
-# пять единиц подряд, без лишних и без многопроходных «замен»).
-STUFF_ONES_LIMIT = 5
-
-
 def bytes_to_bits(data: bytes) -> str:
     return ''.join(format(byte, '08b') for byte in data)
 
@@ -112,60 +114,128 @@ def bits_to_bytes(bits: str) -> bytes:
     return bytes(result)
 
 
-def bit_stuff_stream(bits, ones_count=0, mark_inserts=False):
-    """
-    Оптимизированный классический бит-стаффинг (один проход).
-
-    Минимум замен/вставок:
-    - вставляется ровно один бит '0' только после STUFF_ONES_LIMIT
-      единиц подряд;
-    - лишние вставки не делаются;
-    - многопроходная замена шаблона не используется (она даёт
-      больше операций и риск повторной обработки).
-
-    Возвращает (результат, новый_ones_count).
-    Если mark_inserts=True, вставленные '0' помечаются как <u>0</u>.
-    """
-    result = []
-    stuffed_zero = '<u>0</u>' if mark_inserts else '0'
-
-    for bit in bits:
-        result.append(bit)
-        if bit == '1':
-            ones_count += 1
-            if ones_count == STUFF_ONES_LIMIT:
-                result.append(stuffed_zero)
-                ones_count = 0
-        else:
-            ones_count = 0
-
-    return ''.join(result), ones_count
+def find_flag_positions(data: bytes):
+    positions = []
+    start = 0
+    while True:
+        position = data.find(FRAME_FLAG, start)
+        if position == -1:
+            break
+        positions.append(position)
+        start = position + 1
+    return positions
 
 
-def bit_stuff(bits: str) -> str:
-    """Стаффинг битовой строки тела кадра (минимум вставок)."""
-    stuffed, _ = bit_stuff_stream(bits, ones_count=0, mark_inserts=False)
-    return stuffed
+def apply_original_stuffing(payload: bytes):
+    best_payload = None
+    best_positions = None
+    best_offset = 0
+
+    for offset in range(8):
+        work = bytearray(payload)
+        positions = []
+        used = set()
+
+        while True:
+            current = find_flag_positions(bytes(work))
+            new_positions = [pos for pos in current if pos not in used]
+
+            if not new_positions:
+                break
+
+            for pos in new_positions:
+                work[pos] ^= 1 << (7 - offset)
+                used.add(pos)
+                positions.append(pos)
+
+                if len(positions) > MAX_STUFF_POSITIONS:
+                    break
+
+            if len(positions) > MAX_STUFF_POSITIONS:
+                break
+
+        if len(positions) <= MAX_STUFF_POSITIONS and not find_flag_positions(bytes(work)):
+            if best_positions is None or len(positions) < len(best_positions):
+                best_payload = bytes(work)
+                best_positions = sorted(positions)
+                best_offset = offset
+
+    if best_positions is None:
+        raise ValueError("Не удалось выполнить бит-стаффинг без переполнения карты.")
+
+    return best_payload, best_positions, best_offset
+
+
+def build_stuff_map(positions, offset):
+    if len(positions) > MAX_STUFF_POSITIONS:
+        raise ValueError("Слишком много модифицированных участков.")
+
+    bits = format(len(positions), f'0{STUFF_COUNT_BITS}b')
+    bits += format(offset, f'0{STUFF_OFFSET_BITS}b')
+
+    for position in positions:
+        if not 0 <= position < PAYLOAD_SIZE:
+            raise ValueError("Недопустимая позиция бит-стаффинга.")
+        bits += format(position, f'0{STUFF_POSITION_BITS}b')
+
+    bits = bits.ljust(STUFF_MAP_BITS, '0')
+    return bits_to_bytes(bits)
+
+
+def parse_stuff_map(stuff_map: bytes):
+    if len(stuff_map) != RESERVED_SIZE:
+        raise ValueError("Некорректный размер карты бит-стаффинга.")
+
+    bits = bytes_to_bits(stuff_map)
+    count = int(bits[:STUFF_COUNT_BITS], 2)
+    offset_start = STUFF_COUNT_BITS
+    offset_end = offset_start + STUFF_OFFSET_BITS
+    offset = int(bits[offset_start:offset_end], 2)
+
+    if count > MAX_STUFF_POSITIONS or offset > 7:
+        raise ValueError("Некорректная карта бит-стаффинга.")
+
+    positions = []
+    index = offset_end
+    for _ in range(count):
+        position = int(bits[index:index + STUFF_POSITION_BITS], 2)
+        if position >= PAYLOAD_SIZE:
+            raise ValueError("Некорректная позиция в карте бит-стаффинга.")
+        positions.append(position)
+        index += STUFF_POSITION_BITS
+
+    if positions != sorted(set(positions)):
+        raise ValueError("Некорректная карта бит-стаффинга.")
+
+    return positions, offset
+
+
+def restore_original_stuffing(payload: bytes, positions, offset):
+    result = bytearray(payload)
+    for position in positions:
+        result[position] ^= 1 << (7 - offset)
+    return bytes(result)
+
+
+def format_modified_bits(data: bytes, positions, offset, base_byte=0):
+    modified_bits = set()
+    for position in positions:
+        modified_bits.add(position * 8 + offset)
+
+    parts = []
+    for byte_index, byte in enumerate(data):
+        bits = []
+        for bit_index, bit in enumerate(format(byte, '08b')):
+            if (base_byte + byte_index) * 8 + bit_index in modified_bits:
+                bits.append(f'<u>{bit}</u>')
+            else:
+                bits.append(bit)
+        parts.append(''.join(bits))
+    return ','.join(parts)
 
 
 def format_field_bits(data: bytes) -> str:
     return ','.join(format(b, '08b') for b in data)
-
-
-def format_stuffed_field(data: bytes, ones_count: int = 0):
-    """
-    Тот же оптимизированный стаффинг для отображения поля.
-    Счётчик единиц переносится между полями тела кадра.
-    """
-    parts = []
-    for byte in data:
-        marked, ones_count = bit_stuff_stream(
-            format(byte, '08b'),
-            ones_count=ones_count,
-            mark_inserts=True
-        )
-        parts.append(marked)
-    return ','.join(parts), ones_count
 
 
 # ============================================================
@@ -443,15 +513,18 @@ class ComPortApp(QMainWindow):
 
             frame = Frame(bytes(self.tx_buffer))
             frame_bytes = frame.to_bytes()
-
-            # Флаг без стаффинга; стаффится только тело кадра
             body = frame_bytes[FLAG_SIZE:]
-            stuffed_body = bits_to_bytes(bit_stuff(bytes_to_bits(body)))
+            payload = body[:PAYLOAD_SIZE]
+
+            stuffed_payload, positions, offset = apply_original_stuffing(payload)
+            stuff_map = build_stuff_map(positions, offset)
+            stuffed_body = stuffed_payload + stuff_map
+
             self.serial.write(FRAME_FLAG + stuffed_body)
 
             self.tx_count += 1
             self.status_label.setText(f"Передано кадров: {self.tx_count}")
-            self.show_last_frame(frame)
+            self.show_last_frame(frame, stuffed_payload, positions, offset)
 
             self.tx_buffer.clear()
 
@@ -462,44 +535,51 @@ class ComPortApp(QMainWindow):
     # ОКНО СТАТУСА
     # ========================================================
 
-    def show_last_frame(self, frame: Frame):
-        """
-        Названия полей, затем последний кадр до и после бит-стаффинга.
-        Зарезервированные байты не выводятся. Формат — двоичный.
-        Вставленные биты подчёркнуты.
-        """
+    def show_last_frame(self, frame: Frame, stuffed_payload: bytes, positions, offset):
         flag_text = format_field_bits(frame.flag)
 
         data_before = format_field_bits(frame.data) if frame.data else ''
+        padding_before = format_field_bits(frame.padded_data()[len(frame.data):])
         type_before = format(frame.frame_type, '08b')
         number_before = format(frame.frame_number, '08b')
         checksum_before = format(frame.checksum, '08b')
 
         before = (
-            f"{flag_text} {data_before} "
+            f"{flag_text} {data_before} {padding_before} "
             f"{type_before} {number_before} {checksum_before}"
         )
 
-        # После стаффинга: непрерывный поток тела кадра
-        data_after, ones = format_stuffed_field(frame.data)
-        _, ones = format_stuffed_field(frame.padded_data()[len(frame.data):], ones)
-        type_after, ones = format_stuffed_field(bytes([frame.frame_type]), ones)
-        number_after, ones = format_stuffed_field(bytes([frame.frame_number]), ones)
-        checksum_after, _ = format_stuffed_field(bytes([frame.checksum]), ones)
+        data_after = format_modified_bits(
+            stuffed_payload[:len(frame.data)], positions, offset, 0
+        )
+        padding_after = format_modified_bits(
+            stuffed_payload[len(frame.data):MAX_DATA_SIZE],
+            positions, offset, len(frame.data)
+        )
+        type_after = format_modified_bits(
+            stuffed_payload[MAX_DATA_SIZE:MAX_DATA_SIZE + 1],
+            positions, offset, MAX_DATA_SIZE
+        )
+        number_after = format_modified_bits(
+            stuffed_payload[MAX_DATA_SIZE + 1:MAX_DATA_SIZE + 2],
+            positions, offset, MAX_DATA_SIZE + 1
+        )
+        checksum_after = format_modified_bits(
+            stuffed_payload[MAX_DATA_SIZE + 2:MAX_DATA_SIZE + 3],
+            positions, offset, MAX_DATA_SIZE + 2
+        )
 
         after = (
-            f"{flag_text} {data_after} "
+            f"{flag_text} {data_after} {padding_after} "
             f"{type_after} {number_after} {checksum_after}"
         )
 
-        # Заменяем обычные пробелы на неразрывные, чтобы браузер
-        # не переносил строку после флага (и между полями вообще)
         before_html = before.replace(' ', '&nbsp;')
         after_html = after.replace(' ', '&nbsp;')
 
         html = (
             '<div style="white-space: pre-wrap;">'
-            'Флаг Данные Тип_кадра Номер_кадра Контрольная_сумма<br>'
+            'Флаг Данные Заполнение Тип_кадра Номер_кадра Контрольная_сумма<br>'
             f'{before_html}<br>'
             f'{after_html}'
             '</div>'
@@ -531,44 +611,34 @@ class ComPortApp(QMainWindow):
                 self.received_bits = []
                 self.ones_count = 0
 
-            if not self.rx_buffer:
+            needed = BODY_SIZE
+            if len(self.rx_buffer) < needed:
                 return
 
-            current_byte = self.rx_buffer.pop(0)
-            frame_finished = False
-            frame_error = False
+            body = bytes(self.rx_buffer[:needed])
+            del self.rx_buffer[:needed]
 
-            for bit in format(current_byte, '08b'):
-                if self.ones_count == STUFF_ONES_LIMIT:
-                    if bit == '0':
-                        # Оптимизированный дестаффинг: снять ровно
-                        # тот один вставленный '0', что добавил TX
-                        self.ones_count = 0
-                        continue
-                    # Сбойный кадр
-                    frame_error = True
-                    break
+            stuffed_payload = body[:PAYLOAD_SIZE]
+            stuff_map = body[PAYLOAD_SIZE:]
 
-                self.received_bits.append(bit)
-                if bit == '1':
-                    self.ones_count += 1
-                else:
-                    self.ones_count = 0
+            try:
+                positions, offset = parse_stuff_map(stuff_map)
 
-                if len(self.received_bits) >= BODY_BITS:
-                    frame_finished = True
-                    break
+                # Проверяем наличие флага ДО восстановления исходных данных.
+                # После восстановления пользовательские данные МОГУТ содержать
+                # строку FRAME_FLAG, и это не является ошибкой.
+                if find_flag_positions(stuffed_payload):
+                    self._reset_rx_frame()
+                    continue
 
-            if frame_error:
+                payload = restore_original_stuffing(
+                    stuffed_payload, positions, offset
+                )
+            except ValueError:
                 self._reset_rx_frame()
                 continue
 
-            if not frame_finished:
-                continue
-
-            body = bits_to_bytes(''.join(self.received_bits[:BODY_BITS]))
-            # Снятие автодополнения нулями
-            data = body[:MAX_DATA_SIZE].rstrip(b'\x00')
+            data = payload[:MAX_DATA_SIZE].rstrip(b'\x00')
 
             if data:
                 text = data.decode('utf-8', errors='replace')
